@@ -4,7 +4,7 @@ Debian 12 原生 LNMP 生产级管理中枢
 ## 第一步：安装必备的下载工具
 先更新一下软件源，并安装 curl（我把 wget 和 sudo 也加上以防万一）：
 
-``Bash
+``Bash``
 apt update -y
 apt install curl wget sudo -y
 ``
