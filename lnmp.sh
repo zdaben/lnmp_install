@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# Debian 12 原生 LNMP 生产级管理中枢 v4.1 (终极护城河版)
+# Debian 12 原生 LNMP 生产级管理中枢 v5.0 (解耦重构版)
 # ==========================================
 
 GREEN='\033[0;32m'
@@ -11,17 +11,14 @@ NC='\033[0m'
 
 COMMAND=$1
 ACTION=$2
+SUB_ACTION=$3
 BAK_DIR="/var/webak"
 
-# 权限检查
 if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}错误：请使用 root 用户或 sudo 运行此脚本！${NC}"
     exit 1
 fi
 
-# ==========================================
-# 全局防并发原子锁与日志审计 (带自动轮转)
-# ==========================================
 LOG_FILE="/var/log/lnmp-manager.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 echo "===== $(date "+%Y-%m-%d %H:%M:%S") ===== 执行指令: $0 $*" >> "$LOG_FILE"
@@ -33,7 +30,6 @@ flock -n 200 || {
     exit 1
 }
 
-# 精准获取 PHP-FPM 真实版本 (规避 CLI 差异)
 get_php_sock() {
     local PHP_VER
     if command -v php-fpm >/dev/null 2>&1; then
@@ -48,17 +44,40 @@ get_php_sock() {
     fi
 }
 
+get_clean_dbname() {
+    local DOMAIN=$1
+    # 剥离 www. 前缀，剥离顶级域名后缀，替换 - 和 . 为下划线
+    echo "${DOMAIN#www.}" | sed -E 's/\.[a-zA-Z0-9]+$//; s/\./_/g; s/-/_/g'
+}
+
 # ==========================================
-# 模块：一键安装与极致优化 (install)
+# 模块：基础环境安装 (install)
 # ==========================================
 install_lnmp() {
-    echo -e "${GREEN}开始安装 LNMP 生产环境及安全矩阵...${NC}"
-    apt update && apt upgrade -y
+    echo -e "${GREEN}正在拉取当前系统源最新稳定版本信息...${NC}"
+    apt update -y >/dev/null 2>&1
     
-    # 基础组件与安防利器安装
+    NGINX_VER=$(apt-cache show nginx 2>/dev/null | grep Version | head -n1 | awk '{print $2}' | cut -d: -f2 | cut -d- -f1)
+    MARIADB_VER=$(apt-cache show mariadb-server 2>/dev/null | grep Version | head -n1 | awk '{print $2}' | cut -d: -f2 | cut -d+ -f1)
+    PHP_VER_APT=$(apt-cache show php-fpm 2>/dev/null | grep Version | head -n1 | awk '{print $2}' | cut -d: -f2 | cut -d+ -f1)
+
+    echo -e "\n${YELLOW}=== 基础安装版本预检 ===${NC}"
+    echo -e "Web 服务器 : Nginx ${GREEN}${NGINX_VER:-(获取失败，将默认安装)}${NC}"
+    echo -e "数据库引擎 : MariaDB ${GREEN}${MARIADB_VER:-(获取失败，将默认安装)}${NC}"
+    echo -e "PHP 解析器 : PHP-FPM ${GREEN}${PHP_VER_APT:-(获取失败，将默认安装)}${NC}"
+    echo -e "附加组件   : Redis, Certbot, UFW, Fail2ban"
+    echo -e "------------------------------------"
+    read -p "确认执行基础环境构建吗？(y/n) [y]: " CONFIRM_INSTALL
+    CONFIRM_INSTALL=${CONFIRM_INSTALL:-y}
+    if [[ "$CONFIRM_INSTALL" != "y" ]]; then
+        echo "已取消安装。"
+        exit 0
+    fi
+
+    echo -e "${GREEN}开始安装 LNMP 基础包...${NC}"
     apt install nginx mariadb-server php-fpm php-mysql php-xml php-curl php-gd php-mbstring php-imagick php-redis php-bcmath php-intl php-zip redis-server curl wget unzip certbot python3-certbot-nginx ufw htop logrotate fail2ban -y
 
-    # 部署 LNMP 管理日志的自动轮转规则
+    # 日志轮转配置
     cat > /etc/logrotate.d/lnmp-manager <<EOF
 /var/log/lnmp-manager.log {
     weekly
@@ -69,62 +88,8 @@ install_lnmp() {
 }
 EOF
 
-    MEM=$(free -m | awk '/Mem:/ {print $2}')
-
-    # Swap 智能检测与动态分配
-    echo -e "${YELLOW}检查系统 Swap 交换分区...${NC}"
-    if [ "$(swapon --show | wc -l)" -eq 0 ]; then
-        if [ "$MEM" -le 2048 ]; then
-            SWAPSIZE="2G"
-        else
-            SWAPSIZE="1G"
-        fi
-        echo -e "${GREEN}未检测到 Swap，正在自动创建 ${SWAPSIZE} 交换分区...${NC}"
-        if ! fallocate -l "$SWAPSIZE" /swapfile 2>/dev/null; then
-            dd if=/dev/zero of=/swapfile bs=1M count=$((${SWAPSIZE%G} * 1024)) status=progress
-        fi
-        chmod 600 /swapfile
-        mkswap /swapfile
-        swapon /swapfile
-        grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-    else
-        SWAPSIZE="已存在 (无需创建)"
-    fi
-
-    # 0. Linux 内核级调优 (TCP并发 + Ulimit文件句柄解锁)
-    echo -e "${YELLOW}执行底层内核与操作系统资源极限破壁...${NC}"
-    
-    # Ulimit 破壁 (解除 1024 封锁)
-    cat > /etc/security/limits.d/99-lnmp.conf <<EOF
-www-data soft nofile 65535
-www-data hard nofile 65535
-root soft nofile 65535
-root hard nofile 65535
-EOF
-
-    # TCP 栈优化
-    cat > /etc/sysctl.d/99-lnmp-tcp.conf <<EOF
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 65535
-
-net.ipv4.tcp_max_syn_backlog = 65535
-net.ipv4.tcp_fin_timeout = 15
-
-net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_max_tw_buckets = 200000
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_fastopen = 3
-EOF
-    sysctl -p /etc/sysctl.d/99-lnmp-tcp.conf >/dev/null 2>&1
-
-    # 获取精确的 PHP 版本
-    local PHP_SOCK
-    PHP_SOCK=$(get_php_sock)
-    PHP_VER=$(echo "$PHP_SOCK" | grep -oP 'php\K[0-9.]+(?=-fpm)')
-    
-    echo -e "${YELLOW}执行核心服务优化与高可用加固...${NC}"
-    
-    # 1. MariaDB 初始化与动态计算 (包含动态最大连接数)
+    # MariaDB 基础安全初始化
+    echo -e "${YELLOW}执行数据库基础安全加固...${NC}"
     systemctl start mariadb
     mysql -e "DELETE FROM mysql.user WHERE User='';"
     mysql -e "DROP DATABASE IF EXISTS test;"
@@ -132,111 +97,96 @@ EOF
     mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED VIA unix_socket OR mysql_native_password;"
     mysql -e "DELETE FROM mysql.user WHERE User='root' AND Host!='localhost';"
     mysql -e "FLUSH PRIVILEGES;"
-
-    if [ "$MEM" -le 4096 ]; then
-        BUFFER_M=$((MEM * 40 / 100))
-    elif [ "$MEM" -le 16384 ]; then
-        BUFFER_M=$((MEM * 50 / 100))
-    else
-        BUFFER_M=8192
-    fi
-    [ "$BUFFER_M" -lt 128 ] && BUFFER_M=128
-
-    if [ "$MEM" -le 1024 ]; then
-        LOG_FILE_SIZE="64M"
-    elif [ "$MEM" -le 4096 ]; then
-        LOG_FILE_SIZE="128M"
-    else
-        LOG_FILE_SIZE="256M"
-    fi
     
-    # 动态并发连接池防御
-    if [ "$MEM" -le 2048 ]; then
-        MAX_CONN=100
-    elif [ "$MEM" -le 4096 ]; then
-        MAX_CONN=200
-    else
-        MAX_CONN=300
-    fi
+    # Nginx 消除默认 gzip 冲突
+    sed -i 's/^\s*gzip on;/# gzip on;/' /etc/nginx/nginx.conf
+
+    # UFW 与 Fail2ban 基础安防
+    SSH_PORT=$(ss -tlnp | grep sshd | awk '{print $4}' | grep -oP '\d+$' | head -1)
+    SSH_PORT=${SSH_PORT:-22}
     
-    mkdir -p /var/log/mysql
-    chown mysql:mysql /var/log/mysql
+    cat > /etc/fail2ban/jail.local <<EOF
+[DEFAULT]
+bantime  = 3600
+findtime = 600
+maxretry = 5
 
-    cat > /etc/mysql/mariadb.conf.d/60-lnmp.cnf <<EOF
-[mysqld]
-innodb_buffer_pool_size=${BUFFER_M}M
-innodb_log_file_size=${LOG_FILE_SIZE}
-innodb_log_buffer_size=64M
-innodb_flush_log_at_trx_commit=2
-innodb_file_per_table=1
-max_connections=${MAX_CONN}
-table_open_cache=4000
-thread_cache_size=100
-skip-name-resolve
-
-slow_query_log = 1
-slow_query_log_file = /var/log/mysql/slow.log
-long_query_time = 2
+[sshd]
+enabled = true
+port    = ${SSH_PORT}
 EOF
+    systemctl restart fail2ban
+    systemctl enable fail2ban --now
 
-    systemctl stop mariadb
-    sleep 3
-    if pgrep mysqld >/dev/null; then
-        echo -e "${RED}警告：MariaDB (mysqld) 进程未完全退出，跳过 ib_logfile 清理！${NC}"
-    else
-        rm -f /var/lib/mysql/ib_logfile*
-    fi
-    systemctl start mariadb
+    ufw allow "${SSH_PORT}/tcp" comment 'SSH Auto-Detect'
+    ufw allow 'Nginx Full'
+    ufw --force enable
+    systemctl enable certbot.timer --now
+
+    # 守护服务
+    PHP_VER_RUN=$(php -v 2>/dev/null | grep -oP '^PHP \K[0-9]+\.[0-9]+' || ls /etc/php | sort -V | tail -n1)
+    for svc in nginx mariadb redis-server "php${PHP_VER_RUN}-fpm"; do
+        mkdir -p "/etc/systemd/system/${svc}.service.d"
+        cat > "/etc/systemd/system/${svc}.service.d/restart.conf" <<EOF
+[Service]
+Restart=always
+RestartSec=3
+EOF
+    done
+    systemctl daemon-reload
+    systemctl restart nginx "php${PHP_VER_RUN}-fpm" mariadb redis-server
+
+    echo -e "\n${GREEN}🎉 基础环境构建完成！${NC}"
+    echo -e "提示: 当前环境为保守配置配置。请运行 ${YELLOW}lnmp optimize${NC} 执行生产级性能压榨。"
+}
+
+# ==========================================
+# 模块：极限压榨与优化 (optimize)
+# ==========================================
+opt_kernel() {
+    echo -e "${GREEN}正在注入内核级 TCP 并发与 Ulimit 破壁规则...${NC}"
+    cat > /etc/security/limits.d/99-lnmp.conf <<EOF
+www-data soft nofile 65535
+www-data hard nofile 65535
+root soft nofile 65535
+root hard nofile 65535
+EOF
+    cat > /etc/sysctl.d/99-lnmp-tcp.conf <<EOF
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_max_tw_buckets = 200000
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_fastopen = 3
+EOF
+    sysctl -p /etc/sysctl.d/99-lnmp-tcp.conf >/dev/null 2>&1
     
-    # 2. Nginx 高并发极限优化 & Map 缓存引擎重构
+    MEM=$(free -m | awk '/Mem:/ {print $2}')
+    if [ "$(swapon --show | wc -l)" -eq 0 ]; then
+        SWAPSIZE=$([ "$MEM" -le 2048 ] && echo "2G" || echo "1G")
+        fallocate -l "$SWAPSIZE" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=$((${SWAPSIZE%G} * 1024)) status=none
+        chmod 600 /swapfile
+        mkswap /swapfile >/dev/null 2>&1
+        swapon /swapfile
+        grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    fi
+    echo -e "-> ${YELLOW}完成${NC}"
+}
+
+opt_nginx() {
+    echo -e "${GREEN}正在重构 Nginx 高并发引擎与全局缓存 Map...${NC}"
     sed -i 's/^worker_processes.*/worker_processes auto;/' /etc/nginx/nginx.conf
-    
-    if grep -q "worker_connections" /etc/nginx/nginx.conf; then
-        sed -i 's/.*worker_connections.*/\tworker_connections 65535;/' /etc/nginx/nginx.conf
-    else
-        sed -i '/events {/a \    worker_connections 65535;' /etc/nginx/nginx.conf
-    fi
-    
-    grep -q "worker_rlimit_nofile 65535" /etc/nginx/nginx.conf || sed -i '/worker_processes/a worker_rlimit_nofile 65535;' /etc/nginx/nginx.conf
+    grep -q "worker_connections" /etc/nginx/nginx.conf && sed -i 's/.*worker_connections.*/\tworker_connections 65535;/' /etc/nginx/nginx.conf || sed -i '/events {/a \    worker_connections 65535;' /etc/nginx/nginx.conf
+    grep -q "worker_rlimit_nofile" /etc/nginx/nginx.conf || sed -i '/worker_processes/a worker_rlimit_nofile 65535;' /etc/nginx/nginx.conf
     grep -q "multi_accept on;" /etc/nginx/nginx.conf || sed -i '/worker_connections/a \\tmulti_accept on;' /etc/nginx/nginx.conf
     grep -q "use epoll;" /etc/nginx/nginx.conf || sed -i '/worker_connections/a \\tuse epoll;' /etc/nginx/nginx.conf
     grep -q "tcp_nopush on;" /etc/nginx/nginx.conf || sed -i '/sendfile on;/a \\ttcp_nopush on;\n\ttcp_nodelay on;' /etc/nginx/nginx.conf
     grep -q "keepalive_requests" /etc/nginx/nginx.conf || sed -i '/keepalive_timeout/a \\tkeepalive_requests 1000;' /etc/nginx/nginx.conf
     sed -i 's/.*keepalive_timeout.*/\tkeepalive_timeout 65;/' /etc/nginx/nginx.conf
     sed -i 's/# server_tokens off;/server_tokens off;/' /etc/nginx/nginx.conf
-    
-    cat > /etc/nginx/conf.d/security_headers.conf <<EOF
-add_header X-Frame-Options "SAMEORIGIN" always;
-add_header X-Content-Type-Options "nosniff" always;
-add_header X-XSS-Protection "1; mode=block" always;
-add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-EOF
 
-    cat > /etc/nginx/conf.d/rate_limit.conf <<EOF
-limit_req_zone \$binary_remote_addr zone=general:10m rate=10r/s;
-limit_req_zone \$binary_remote_addr zone=login:10m rate=1r/s;
-EOF
-
-    cat > /etc/nginx/conf.d/gzip.conf <<EOF
-gzip on;
-gzip_comp_level 5;
-gzip_min_length 256;
-gzip_proxied any;
-gzip_vary on;
-gzip_types text/plain text/css application/json application/javascript application/x-javascript text/xml application/xml application/xml+rss text/javascript image/svg+xml;
-EOF
-
-    cat > /etc/nginx/conf.d/open_file_cache.conf <<EOF
-open_file_cache max=200000 inactive=20s;
-open_file_cache_valid 30s;
-open_file_cache_min_uses 2;
-open_file_cache_errors on;
-EOF
-
-    mkdir -p /var/cache/nginx/wordpress
-    chown -R www-data:www-data /var/cache/nginx
-
-    # 高效 Map 缓存映射引擎
     cat > /etc/nginx/conf.d/fastcgi_cache_map.conf <<EOF
 map \$http_cookie \$skip_cache {
     default 0;
@@ -246,26 +196,20 @@ map \$http_cookie \$skip_cache {
     ~*wp-postpass 1;
 }
 EOF
-
-    cat > /etc/nginx/conf.d/fastcgi_cache.conf <<EOF
-fastcgi_cache_path /var/cache/nginx/wordpress levels=1:2 keys_zone=WORDPRESS:100m inactive=60m;
-fastcgi_cache_key "\$scheme\$request_method\$host\$request_uri";
-fastcgi_cache_use_stale error timeout invalid_header http_500;
-fastcgi_ignore_headers Cache-Control Expires Set-Cookie;
-fastcgi_cache_lock on;
-fastcgi_cache_lock_timeout 10s;
+    cat > /etc/nginx/conf.d/rate_limit.conf <<EOF
+limit_req_zone \$binary_remote_addr zone=general:10m rate=10r/s;
+limit_req_zone \$binary_remote_addr zone=login:10m rate=1r/s;
 EOF
-    
-    # 3. PHP-FPM 智能 OOM 防御算法 (80M/Worker)
-    RESERVE=512
-    AVAIL_MEM=$((MEM - RESERVE))
-    [ "$AVAIL_MEM" -lt 256 ] && AVAIL_MEM=256
-    
-    PHP_MEM=80
-    MAX_C=$((AVAIL_MEM / PHP_MEM))
-    [ "$MAX_C" -gt 150 ] && MAX_C=150
-    [ "$MAX_C" -lt 10 ] && MAX_C=10
-    
+    systemctl reload nginx
+    echo -e "-> ${YELLOW}完成${NC}"
+}
+
+opt_php() {
+    echo -e "${GREEN}正在调校 PHP-FPM 防 OOM 进程池与 Realpath 缓存...${NC}"
+    PHP_VER=$(php -v 2>/dev/null | grep -oP '^PHP \K[0-9]+\.[0-9]+' || ls /etc/php | sort -V | tail -n1)
+    MEM=$(free -m | awk '/Mem:/ {print $2}')
+    AVAIL_MEM=$((MEM - 512)); [ "$AVAIL_MEM" -lt 256 ] && AVAIL_MEM=256
+    MAX_C=$((AVAIL_MEM / 80)); [ "$MAX_C" -gt 150 ] && MAX_C=150; [ "$MAX_C" -lt 10 ] && MAX_C=10
     START_C=$((MAX_C / 4)); [ "$START_C" -lt 4 ] && START_C=4
     MIN_C=$((MAX_C / 4)); [ "$MIN_C" -lt 4 ] && MIN_C=4
     MAX_SPARE=$((MAX_C / 2)); [ "$MAX_SPARE" -lt 10 ] && MAX_SPARE=10
@@ -281,77 +225,79 @@ EOF
     PHP_INI="/etc/php/${PHP_VER}/fpm/php.ini"
     sed -i 's/^;*\s*opcache\.enable\s*=.*/opcache.enable=1/' "$PHP_INI"
     sed -i 's/^;*\s*opcache\.memory_consumption\s*=.*/opcache.memory_consumption=256/' "$PHP_INI"
-    sed -i 's/^;*\s*opcache\.interned_strings_buffer\s*=.*/opcache.interned_strings_buffer=16/' "$PHP_INI"
-    sed -i 's/^;*\s*opcache\.max_accelerated_files\s*=.*/opcache.max_accelerated_files=10000/' "$PHP_INI"
     sed -i 's/^;*\s*opcache\.revalidate_freq\s*=.*/opcache.revalidate_freq=60/' "$PHP_INI"
     sed -i 's/^;*\s*post_max_size\s*=.*/post_max_size = 100M/' "$PHP_INI"
     sed -i 's/^;*\s*upload_max_filesize\s*=.*/upload_max_filesize = 100M/' "$PHP_INI"
     sed -i 's/^;*\s*realpath_cache_size\s*=.*/realpath_cache_size = 4096k/' "$PHP_INI"
-    sed -i 's/^;*\s*realpath_cache_ttl\s*=.*/realpath_cache_ttl = 600/' "$PHP_INI"
+    
+    systemctl restart "php${PHP_VER}-fpm"
+    echo -e "-> ${YELLOW}完成 (Max Workers: $MAX_C)${NC}"
+}
 
-    # 4. Redis Unix Socket 内存直连 (修复正则)
-    REDIS_MEM=$((MEM * 20 / 100))
-    [ "$REDIS_MEM" -lt 64 ] && REDIS_MEM=64
+opt_mariadb() {
+    echo -e "${GREEN}正在配置 MariaDB 动态缓冲与 IO 刷盘策略...${NC}"
+    MEM=$(free -m | awk '/Mem:/ {print $2}')
+    if [ "$MEM" -le 4096 ]; then BUFFER_M=$((MEM * 40 / 100)); LOG_SIZE="128M"; MAX_CONN=200
+    elif [ "$MEM" -le 16384 ]; then BUFFER_M=$((MEM * 50 / 100)); LOG_SIZE="256M"; MAX_CONN=300
+    else BUFFER_M=8192; LOG_SIZE="512M"; MAX_CONN=500
+    fi
+    [ "$BUFFER_M" -lt 128 ] && BUFFER_M=128
+
+    cat > /etc/mysql/mariadb.conf.d/60-lnmp.cnf <<EOF
+[mysqld]
+innodb_buffer_pool_size=${BUFFER_M}M
+innodb_log_file_size=${LOG_SIZE}
+innodb_flush_log_at_trx_commit=2
+innodb_file_per_table=1
+max_connections=${MAX_CONN}
+table_open_cache=4000
+skip-name-resolve
+EOF
+    systemctl restart mariadb
+    echo -e "-> ${YELLOW}完成 (Buffer: ${BUFFER_M}MB, MaxConn: ${MAX_CONN})${NC}"
+}
+
+opt_redis() {
+    echo -e "${GREEN}正在激活 Redis IPC(Unix Socket) 与内存淘汰策略...${NC}"
+    MEM=$(free -m | awk '/Mem:/ {print $2}')
+    REDIS_MEM=$((MEM * 20 / 100)); [ "$REDIS_MEM" -lt 64 ] && REDIS_MEM=64
     usermod -aG redis www-data
     
-    grep -q "^maxmemory " /etc/redis/redis.conf
-    if [ $? -ne 0 ]; then
-        echo -e "\nmaxmemory ${REDIS_MEM}mb" >> /etc/redis/redis.conf
-        echo "maxmemory-policy allkeys-lru" >> /etc/redis/redis.conf
-        echo "unixsocket /run/redis/redis-server.sock" >> /etc/redis/redis.conf
-        echo "unixsocketperm 770" >> /etc/redis/redis.conf
-    else
-        sed -i "s/^maxmemory .*/maxmemory ${REDIS_MEM}mb/" /etc/redis/redis.conf
-        sed -i 's/^maxmemory-policy.*/maxmemory-policy allkeys-lru/' /etc/redis/redis.conf
-        sed -i 's/^#*\s*unixsocket \/.*/unixsocket \/run\/redis\/redis-server.sock/' /etc/redis/redis.conf
-        sed -i 's/^#*\s*unixsocketperm.*/unixsocketperm 770/' /etc/redis/redis.conf
-    fi
-
-    # 5. Fail2ban & 防火墙安防矩阵部署
-    SSH_PORT=$(ss -tlnp | grep sshd | awk '{print $4}' | grep -oP '\d+$' | head -1)
-    SSH_PORT=${SSH_PORT:-22}
+    grep -q "^maxmemory " /etc/redis/redis.conf || echo -e "\nmaxmemory ${REDIS_MEM}mb\nmaxmemory-policy allkeys-lru\nunixsocket /run/redis/redis-server.sock\nunixsocketperm 770" >> /etc/redis/redis.conf
+    sed -i "s/^maxmemory .*/maxmemory ${REDIS_MEM}mb/" /etc/redis/redis.conf
+    sed -i 's/^maxmemory-policy.*/maxmemory-policy allkeys-lru/' /etc/redis/redis.conf
+    sed -i 's/^#*\s*unixsocket \/.*/unixsocket \/run\/redis\/redis-server.sock/' /etc/redis/redis.conf
+    sed -i 's/^#*\s*unixsocketperm.*/unixsocketperm 770/' /etc/redis/redis.conf
     
-    cat > /etc/fail2ban/jail.local <<EOF
-[DEFAULT]
-bantime  = 3600
-findtime = 600
-maxretry = 5
+    systemctl restart redis-server
+    echo -e "-> ${YELLOW}完成 (限额: ${REDIS_MEM}MB)${NC}"
+}
 
-[sshd]
-enabled = true
-port    = ${SSH_PORT}
-
-[nginx-http-auth]
-enabled = true
-EOF
-    systemctl restart fail2ban
-    systemctl enable fail2ban --now
-
-    ufw allow "${SSH_PORT}/tcp" comment 'SSH Auto-Detect'
-    ufw allow 'Nginx Full'
-    ufw --force enable
-    systemctl enable certbot.timer --now
-
-    # 6. Systemd 不死鸟守护机制 (自动原地复活)
-    echo -e "${YELLOW}注入 Systemd 服务守护层...${NC}"
-    for svc in nginx mariadb redis-server "php${PHP_VER}-fpm"; do
-        mkdir -p "/etc/systemd/system/${svc}.service.d"
-        cat > "/etc/systemd/system/${svc}.service.d/restart.conf" <<EOF
-[Service]
-Restart=always
-RestartSec=3
-EOF
-    done
-    systemctl daemon-reload
-
-    systemctl restart nginx "php${PHP_VER}-fpm" mariadb redis-server
+optimize_lnmp() {
+    echo -e "${GREEN}=========================================${NC}"
+    echo -e "        LNMP 生产环境极客压榨中心"
+    echo -e "${GREEN}=========================================${NC}"
+    echo -e " 1) 优化内核 TCP 协议栈与连接数上限"
+    echo -e " 2) 重构 Nginx 高并发模式与抗爆破映射"
+    echo -e " 3) 调校 PHP-FPM 防 OOM 进程池"
+    echo -e " 4) 优化 MariaDB 动态内存缓冲与极速 IO"
+    echo -e " 5) 激活 Redis 内存直连 (Unix Socket)"
+    echo -e " 6) ${YELLOW}一键执行全部极限优化 (推荐)${NC}"
+    echo -e " 0) 退出"
+    echo -e "========================================="
+    read -p "请选择优化项 [0-6]: " OPT_CHOICE
     
-    echo -e "${GREEN}LNMP 生产环境 (v4.1 终极护城河版) 部署完毕！${NC}"
-    echo -e "物理内存: ${YELLOW}${MEM} MB${NC} | Swap 动态缓冲: ${YELLOW}${SWAPSIZE}${NC}"
-    echo -e "系统内核: ${YELLOW}1024文件锁已解除 / TCP 并发核弹栈已就位${NC}"
-    echo -e "高可用池: ${YELLOW}全系服务进程注入 Systemd 自动复活机制${NC}"
-    echo -e "MariaDB: Max Conn = ${YELLOW}${MAX_CONN}${NC} | 自适应负载阈值"
-    echo -e "安防矩阵: ${YELLOW}Fail2ban 防爆破已启动 (SSH 端口: ${SSH_PORT})${NC}"
+    case "$OPT_CHOICE" in
+        1) opt_kernel ;;
+        2) opt_nginx ;;
+        3) opt_php ;;
+        4) opt_mariadb ;;
+        5) opt_redis ;;
+        6) opt_kernel; opt_nginx; opt_php; opt_mariadb; opt_redis ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效选项！${NC}" ;;
+    esac
+    echo -e "${GREEN}🎉 优化任务执行完毕！${NC}"
 }
 
 # ==========================================
@@ -359,7 +305,6 @@ EOF
 # ==========================================
 manage_services() {
     local cmd=$1
-    local PHP_SOCK
     PHP_SOCK=$(get_php_sock)
     PHP_VER=$(echo "$PHP_SOCK" | grep -oP 'php\K[0-9.]+(?=-fpm)')
     echo -e "${GREEN}正在执行 $cmd 操作...${NC}"
@@ -381,23 +326,14 @@ manage_services() {
     done
 }
 
-update_lnmp() {
-    echo -e "${GREEN}开始执行 LNMP 生产环境热更新...${NC}"
-    apt update
-    apt --only-upgrade install nginx mariadb-server php-fpm php-mysql redis-server -y
-    echo -e "${GREEN}核心组件更新检查完毕。${NC}"
-    systemctl daemon-reload
-    manage_services "reload"
-}
-
 # ==========================================
-# 模块：虚拟主机管理 (vhost add/del/list)
+# 模块：虚拟主机管理 (vhost add/del/list/database)
 # ==========================================
 vhost_add() {
     PHP_SOCK=$(get_php_sock)
     if [ -z "$PHP_SOCK" ]; then echo -e "${RED}未检测到 PHP，请先运行 lnmp install${NC}"; exit 1; fi
 
-    read -p "请输入主域名 (例如: example.com): " DOMAIN
+    read -p "请输入主域名 (例如: hho.icu): " DOMAIN
     if ! [[ "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$ ]]; then
         echo -e "${RED}错误：域名格式不合法！${NC}"
         exit 1
@@ -414,9 +350,9 @@ vhost_add() {
     read -p "是否创建 MySQL 数据库? (y/n) [y]: " CREATE_DB
     CREATE_DB=${CREATE_DB:-y}
     if [ "$CREATE_DB" == "y" ]; then
-        DB_NAME=${DOMAIN//./_}
-        read -p "请输入数据库名 (默认: $DB_NAME): " INPUT_DB
-        DB_NAME=${INPUT_DB:-$DB_NAME}
+        SUGGESTED_DB=$(get_clean_dbname "$DOMAIN")
+        read -p "请输入数据库名 (默认: $SUGGESTED_DB): " INPUT_DB
+        DB_NAME=${INPUT_DB:-$SUGGESTED_DB}
         read -s -p "请输入数据库密码: " DB_PASS
         echo ""
         if [ -z "$DB_PASS" ]; then CREATE_DB="n"; fi
@@ -424,16 +360,8 @@ vhost_add() {
 
     read -p "是否使用 Certbot 申请 SSL ? (y/n) [y]: " ENABLE_SSL
     ENABLE_SSL=${ENABLE_SSL:-y}
-    if [ "$ENABLE_SSL" == "y" ]; then
-        read -p "请输入邮箱 (用于SSL通知，留空跳过): " SSL_EMAIL
-        if [ -n "$SSL_EMAIL" ]; then
-            CERT_EMAIL_ARG="-m $SSL_EMAIL"
-        else
-            CERT_EMAIL_ARG="--register-unsafely-without-email"
-        fi
-    fi
 
-    echo -e "\n${YELLOW}正在生成高并发 Nginx Vhost 配置...${NC}"
+    echo -e "\n${YELLOW}正在生成 Nginx Vhost 配置...${NC}"
     mkdir -p "$WEB_ROOT"
     chown -R www-data:www-data "$WEB_ROOT"
     find "$WEB_ROOT" -type d -exec chmod 755 {} \;
@@ -448,10 +376,6 @@ server {
     
     client_max_body_size 100M;
     
-    # 引入全局安全头
-    include /etc/nginx/conf.d/security_headers.conf;
-
-    # 动态缓存开关 (依赖顶层 map 映射)
     set \$bypass_cache \$skip_cache;
     if (\$request_method = POST) { set \$bypass_cache 1; }
     if (\$query_string != "") { set \$bypass_cache 1; }
@@ -462,14 +386,12 @@ server {
         try_files \$uri \$uri/ /index.php?\$args;
     }
 
-    # 登录抗爆破壁垒
     location = /wp-login.php {
         limit_req zone=login burst=3 nodelay;
         include snippets/fastcgi-php.conf;
         fastcgi_pass unix:$PHP_SOCK;
     }
 
-    # 绝对禁区
     location = /xmlrpc.php { deny all; access_log off; }
     location ~* wp-config.php { deny all; access_log off; }
     location ~* /wp-content/uploads/.*\.php$ { deny all; access_log off; }
@@ -479,7 +401,6 @@ server {
         include snippets/fastcgi-php.conf;
         fastcgi_pass unix:$PHP_SOCK;
         
-        # FastCGI 引擎接入
         fastcgi_cache_bypass \$bypass_cache;
         fastcgi_no_cache \$bypass_cache;
         fastcgi_cache WORDPRESS;
@@ -506,10 +427,7 @@ EOF
     fi
 
     if [ "$ENABLE_SSL" == "y" ]; then
-        certbot --nginx $CERTBOT_DOMAINS --non-interactive --agree-tos $CERT_EMAIL_ARG --redirect
-        if [ $? -ne 0 ]; then
-            echo -e "${RED}警告: SSL 证书申请失败。网站仍可通过 HTTP 访问。${NC}"
-        fi
+        certbot --nginx $CERTBOT_DOMAINS --non-interactive --agree-tos --register-unsafely-without-email --redirect
     fi
 
     echo -e "\n${GREEN}🎉 $DOMAIN 部署完毕！${NC}"
@@ -520,11 +438,18 @@ vhost_list() {
     ls /etc/nginx/sites-enabled/ 2>/dev/null | sed 's/\.conf$//' | grep -v "^default$" || echo "暂无网站"
 }
 
+vhost_db_list() {
+    echo -e "${GREEN}=== 业务数据库列表 ===${NC}"
+    mysql -e "SHOW DATABASES;" | grep -Ev "^(Database|information_schema|performance_schema|mysql|sys)$" || echo "暂无业务数据库"
+}
+
 vhost_del() {
     vhost_list
     read -p "请输入要彻底删除的域名: " DOMAIN
     if [ -z "$DOMAIN" ]; then exit 1; fi
-    read -p "警告：是否同时删除同名数据库 ${DOMAIN//./_}? (y/n) [n]: " DEL_DB
+    
+    SUGGESTED_DB=$(get_clean_dbname "$DOMAIN")
+    read -p "警告：是否同时删除对应的数据库 (默认名: $SUGGESTED_DB)? (y/n) [n]: " DEL_DB
     
     rm -f "/etc/nginx/sites-available/$DOMAIN.conf"
     rm -f "/etc/nginx/sites-enabled/$DOMAIN.conf"
@@ -534,7 +459,8 @@ vhost_del() {
     systemctl reload nginx
     
     if [ "$DEL_DB" == "y" ]; then
-        DB_NAME=${DOMAIN//./_}
+        read -p "确认要删除的数据库名 (默认: $SUGGESTED_DB): " INPUT_DB
+        DB_NAME=${INPUT_DB:-$SUGGESTED_DB}
         mysql -e "DROP DATABASE IF EXISTS \`$DB_NAME\`;"
         mysql -e "DROP USER IF EXISTS '$DB_NAME'@'localhost';"
         mysql -e "FLUSH PRIVILEGES;"
@@ -543,129 +469,21 @@ vhost_del() {
 }
 
 # ==========================================
-# 模块：备份与恢复 (backup/recover)
-# ==========================================
-backup_site() {
-    mkdir -p "$BAK_DIR"
-    vhost_list
-    read -p "请输入要备份的域名: " DOMAIN
-    if [ ! -d "/var/www/$DOMAIN" ]; then echo -e "${RED}找不到网站目录！${NC}"; exit 1; fi
-    
-    DATE=$(date +%Y%m%d_%H%M)
-    WEB_FILE="${BAK_DIR}/${DOMAIN}_${DATE}.tar.gz"
-    DB_FILE="${BAK_DIR}/${DOMAIN}_${DATE}.sql.gz"
-    DB_NAME=${DOMAIN//./_}
-    
-    echo -e "${YELLOW}正在打包网站文件...${NC}"
-    tar -czf "$WEB_FILE" -C "/var/www/$DOMAIN" .
-    
-    echo -e "${YELLOW}正在生成 SHA256 防篡改校验码...${NC}"
-    sha256sum "$WEB_FILE" > "${WEB_FILE}.sha256"
-    
-    echo -e "${YELLOW}正在导出并压缩数据库...${NC}"
-    if ! mysqldump "$DB_NAME" 2>/dev/null | gzip > "$DB_FILE"; then 
-        echo -e "${RED}警告: 数据库 $DB_NAME 导出失败或不存在！${NC}"
-        rm -f "$DB_FILE"
-    fi
-    
-    echo -e "${GREEN}备份完成！文件及安全校验已存入 $BAK_DIR${NC}"
-    ls -lh "$BAK_DIR"/${DOMAIN}_${DATE}.*
-}
-
-recover_site() {
-    vhost_list
-    read -p "请输入要恢复的域名 (需先运行 vhost add): " DOMAIN
-    if [ ! -d "/var/www/$DOMAIN" ]; then echo -e "${RED}请先运行 lnmp vhost add $DOMAIN${NC}"; exit 1; fi
-    
-    read -p "请输入备份目录 (默认: $BAK_DIR): " INPUT_DIR
-    TARGET_DIR=${INPUT_DIR:-$BAK_DIR}
-    
-    WEB_FILE=$(ls "$TARGET_DIR"/"$DOMAIN"*.tar.gz 2>/dev/null | tail -n 1)
-    DB_FILE=$(ls "$TARGET_DIR"/"$DOMAIN"*.sql.gz 2>/dev/null | tail -n 1)
-    DB_NAME=${DOMAIN//./_}
-    
-    if [ -z "$WEB_FILE" ]; then echo -e "${RED}未找到对应的 .tar.gz 文件！${NC}"; exit 1; fi
-
-    echo -e "${RED}!!! 严重警告 !!!${NC}"
-    echo -e "即将执行灾难恢复。此操作将彻底覆盖当前 ${YELLOW}/var/www/$DOMAIN${NC} 下的所有文件及数据库 ${YELLOW}$DB_NAME${NC}。"
-    read -p "你确定要继续吗? (yes/no): " CONFIRM
-    if [ "$CONFIRM" != "yes" ]; then
-        echo "已取消恢复操作。"
-        exit 0
-    fi
-    
-    echo -e "${YELLOW}执行完整性校验...${NC}"
-    if [ -f "${WEB_FILE}.sha256" ]; then
-        if ! sha256sum -c "${WEB_FILE}.sha256" >/dev/null 2>&1; then
-            echo -e "${RED}致命错误：备份文件校验失败，数据可能已损坏！${NC}"
-            exit 1
-        fi
-        echo -e "${GREEN}SHA256 校验通过。${NC}"
-    else
-        echo -e "${YELLOW}警告：未找到关联的 .sha256 文件，跳过完整性校验。${NC}"
-    fi
-
-    echo -e "${YELLOW}解压文件: $WEB_FILE${NC}"
-    tar -xzf "$WEB_FILE" -C "/var/www/$DOMAIN"
-    chown -R www-data:www-data "/var/www/$DOMAIN"
-    find "/var/www/$DOMAIN" -type d -exec chmod 755 {} \;
-    find "/var/www/$DOMAIN" -type f -exec chmod 644 {} \;
-    
-    if [ -n "$DB_FILE" ]; then
-        echo -e "${YELLOW}解压并导入数据库: $DB_FILE${NC}"
-        zcat "$DB_FILE" | mysql "$DB_NAME"
-    else
-        echo -e "${RED}未找到数据库压缩包，跳过数据库恢复。${NC}"
-    fi
-    
-    echo -e "${GREEN}🎉 网站恢复与权限重置完成！${NC}"
-}
-
-# ==========================================
-# 看板模块 (bench/top/php/info)
+# 模块：看板 (bench/top/php/info)
 # ==========================================
 show_bench() {
     echo -e "${GREEN}=== LNMP 生产环境综合体检诊断 ===${NC}"
-    echo -e "${YELLOW}[1] Nginx 核心状态${NC}"
     nginx -v
-    systemctl status nginx | grep -E 'Active:|Memory:'
-    
-    echo -e "\n${YELLOW}[2] PHP-FPM / OPcache 状态${NC}"
     php -v | head -n 1
-    php -i | grep -i opcache.enable
-    php -i | grep -i opcache.memory_consumption
-    
-    echo -e "\n${YELLOW}[3] MariaDB 连接与慢查询状态${NC}"
     mysqladmin status
-    ls -lh /var/log/mysql/slow.log 2>/dev/null || echo "慢查询日志暂未生成"
-    
-    echo -e "\n${YELLOW}[4] Redis 存活与内存状态${NC}"
-    redis-cli ping
     redis-cli info memory | grep -E 'used_memory_human|maxmemory_human'
-    
-    echo -e "\n${YELLOW}[5] Certbot 自动续期服务${NC}"
     systemctl is-active certbot.timer
-}
-
-show_php_info() {
-    echo -e "${GREEN}=== PHP 版本信息 ===${NC}"
-    php -v
-    echo -e "\n${GREEN}=== 已安装的核心扩展 ===${NC}"
-    php -m | grep -E -i 'opcache|redis|imagick|mysqli|curl|gd|mbstring|zip'
-}
-
-show_sys_info() {
-    echo -e "${GREEN}=== 系统基础信息 ===${NC}"
-    uptime
-    free -m
-    df -h /
 }
 
 show_top() {
     echo -e "${GREEN}=== LNMP 性能监控看板 ===${NC}"
     uptime
     free -h
-    echo -e "\n${YELLOW}[网络与并发 (TCP)]${NC}"
     ss -s | grep TCP
 }
 
@@ -674,40 +492,40 @@ show_top() {
 # ==========================================
 case "$COMMAND" in
     install) install_lnmp ;;
+    optimize) optimize_lnmp ;;
     start|stop|restart|reload|status) manage_services "$COMMAND" ;;
-    update) update_lnmp ;;
+    update) apt update && apt --only-upgrade install nginx mariadb-server php-fpm php-mysql redis-server -y && manage_services "reload" ;;
     bench) show_bench ;;
-    recover) recover_site ;;
-    backup) backup_site ;;
-    php) show_php_info ;;
-    info) show_sys_info ;;
     top) manage_services "status"; show_top ;;
     vhost)
         case "$ACTION" in
             add) vhost_add ;;
             del) vhost_del ;;
             list) vhost_list ;;
-            *) echo -e "${YELLOW}用法: lnmp vhost {add|del|list}${NC}" ;;
+            database)
+                if [ "$SUB_ACTION" == "list" ]; then
+                    vhost_db_list
+                else
+                    echo -e "${YELLOW}用法: lnmp vhost database list${NC}"
+                fi
+                ;;
+            *) echo -e "${YELLOW}用法: lnmp vhost {add|del|list|database list}${NC}" ;;
         esac
         ;;
     *)
         echo -e "${GREEN}=========================================${NC}"
-        echo -e "  Debian 12 LNMP 管理中枢 v4.1 (终极护城河版)"
+        echo -e "  Debian 12 LNMP 管理中枢 v5.0 (解耦重构版)"
         echo -e "${GREEN}=========================================${NC}"
         echo -e "系统运维:"
-        echo -e "  lnmp install    - Ulimit解锁 / Fail2ban防御 / Systemd守护"
-        echo -e "  lnmp update     - 核心环境组件平滑升级"
-        echo -e "  lnmp restart    - 重启 LNMP 核心服务"
-        echo -e "  lnmp status     - 服务运行状态巡检"
-        echo -e "  lnmp top        - 性能与监控看板 (并发/资源)"
-        echo -e "  lnmp bench      - 系统深度体检 (存活/缓存/慢查询)"
+        echo -e "  lnmp install       - 基础构建 (拉取稳定源/安全加固)"
+        echo -e "  lnmp optimize      - 极限压榨 (动态调优内核与连接池)"
+        echo -e "  lnmp update        - 核心环境组件平滑升级"
+        echo -e "  lnmp status/top    - 服务运行状态巡检与看板"
         echo -e "\n虚拟主机:"
-        echo -e "  lnmp vhost add  - 智能虚拟主机 (带CC限速/安全头/Map缓存引擎)"
-        echo -e "  lnmp vhost del  - 静默回收主机及关联数据库/证书"
-        echo -e "  lnmp vhost list - 运行节点列表清单"
-        echo -e "\n数据灾备:"
-        echo -e "  lnmp backup     - 强一致性热备 (带 SHA256 完整校验)"
-        echo -e "  lnmp recover    - 交互式灾难恢复 (前置校验防污染)"
+        echo -e "  lnmp vhost add     - 智能虚拟主机 (自动提取干净 DB 名)"
+        echo -e "  lnmp vhost del     - 静默回收主机及关联数据库/证书"
+        echo -e "  lnmp vhost list    - 运行节点列表清单"
+        echo -e "  lnmp vhost database list - 查看所有业务数据库"
         echo -e "========================================="
         ;;
 esac
