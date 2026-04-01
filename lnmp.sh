@@ -205,6 +205,17 @@ map \$http_cookie \$skip_cache {
     ~*wp-postpass 1;
 }
 EOF
+    # [补丁] 创建物理缓存池与字典定义
+    mkdir -p /var/cache/nginx/wordpress
+    chown -R www-data:www-data /var/cache/nginx
+    cat > /etc/nginx/conf.d/fastcgi_cache.conf <<EOF
+fastcgi_cache_path /var/cache/nginx/wordpress levels=1:2 keys_zone=WORDPRESS:100m inactive=60m;
+fastcgi_cache_key "\$scheme\$request_method\$host\$request_uri";
+fastcgi_cache_use_stale error timeout invalid_header http_500;
+fastcgi_ignore_headers Cache-Control Expires Set-Cookie;
+fastcgi_cache_lock on;
+fastcgi_cache_lock_timeout 10s;
+EOF
     cat > /etc/nginx/conf.d/rate_limit.conf <<EOF
 limit_req_zone \$binary_remote_addr zone=general:10m rate=10r/s;
 limit_req_zone \$binary_remote_addr zone=login:10m rate=1r/s;
