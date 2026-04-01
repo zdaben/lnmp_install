@@ -377,6 +377,19 @@ vhost_add() {
     fi
 
     echo -e "\n${YELLOW}正在生成网站的 Nginx 配置文件...${NC}"
+    # [防御性补丁] 确保 FastCGI 缓存池前置依赖存在，防止 Nginx 崩溃
+    if [ ! -f "/etc/nginx/conf.d/fastcgi_cache.conf" ]; then
+        mkdir -p /var/cache/nginx/wordpress
+        chown -R www-data:www-data /var/cache/nginx
+        cat > /etc/nginx/conf.d/fastcgi_cache.conf <<'EOF'
+fastcgi_cache_path /var/cache/nginx/wordpress levels=1:2 keys_zone=WORDPRESS:100m inactive=60m;
+fastcgi_cache_key "$scheme$request_method$host$request_uri";
+fastcgi_cache_use_stale error timeout invalid_header http_500;
+fastcgi_ignore_headers Cache-Control Expires Set-Cookie;
+fastcgi_cache_lock on;
+fastcgi_cache_lock_timeout 10s;
+EOF
+    fi
     mkdir -p "$WEB_ROOT"
     chown -R www-data:www-data "$WEB_ROOT"
     find "$WEB_ROOT" -type d -exec chmod 755 {} \;
