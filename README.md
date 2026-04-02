@@ -3,7 +3,7 @@
 ## 一键安装脚本
 
 ```Bash
-apt update -y && apt install curl wget sudo -y && curl -sSLo /usr/local/bin/lnmp https://raw.githubusercontent.com/zdaben/lnmp/refs/heads/main/lnmp.sh && chmod +x /usr/local/bin/lnmp && lnmp install
+apt update -y && apt install curl wget sudo -y && curl -sSLo /usr/local/bin/lnmp https://raw.githubusercontent.com/zdaben/lnmp/main/lnmp.sh && chmod +x /usr/local/bin/lnmp && lnmp install
 ```
 
 ```Bash
