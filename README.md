@@ -27,7 +27,7 @@ apt install curl wget sudo -y
 安装好 curl 后，直接重新运行以下命令（已为你去除多余的 sudo）：
 
 ```Bash
-curl -sSLo /usr/local/bin/lnmp https://raw.githubusercontent.com/zdaben/lnmp/refs/heads/main/lnmp.sh
+curl -sSLo /usr/local/bin/lnmp https://raw.githubusercontent.com/zdaben/lnmp/main/lnmp.sh
 chmod +x /usr/local/bin/lnmp
 ```
 
